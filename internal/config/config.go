@@ -52,6 +52,8 @@ var SyncPaths = []string{
 	"contexts",
 	"history.jsonl",
 	"rules",
+	"sessions",
+	"homunculus",
 }
 
 func ConfigDirPath() string {

@@ -193,6 +193,8 @@ func TestSyncPaths(t *testing.T) {
 		"contexts":            false,
 		"history.jsonl":       false,
 		"rules":               false,
+		"sessions":            false,
+		"homunculus":           false,
 	}
 
 	for _, path := range SyncPaths {

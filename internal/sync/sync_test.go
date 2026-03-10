@@ -298,7 +298,7 @@ func TestConfigPaths(t *testing.T) {
 // TestSyncPathsConfig verifies sync paths are properly configured
 func TestSyncPathsConfig(t *testing.T) {
 	// Verify expected paths are in SyncPaths
-	expectedPaths := []string{"CLAUDE.md", "settings.json", "agents", "skills", "plugins", "commands", "hooks"}
+	expectedPaths := []string{"CLAUDE.md", "settings.json", "agents", "skills", "plugins", "commands", "hooks", "sessions", "homunculus"}
 
 	for _, expected := range expectedPaths {
 		found := false
