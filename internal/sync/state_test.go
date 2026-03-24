@@ -1,9 +1,11 @@
 package sync
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -324,4 +326,42 @@ func TestGetLocalFilesSkipsSymlinksInDirectories(t *testing.T) {
 	if _, ok := localFiles["subdir/symlink.txt"]; ok {
 		t.Error("Symlink in subdir should be skipped during directory walk")
 	}
+}
+
+func TestSyncStateConcurrentAccess(t *testing.T) {
+	state := NewState()
+
+	// Create temp files for FileInfo
+	tmpDir := t.TempDir()
+	for i := 0; i < 50; i++ {
+		path := filepath.Join(tmpDir, fmt.Sprintf("file%d.txt", i))
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("content %d", i)), 0644); err != nil {
+			t.Fatalf("Failed to create temp file: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			key := fmt.Sprintf("file%d.txt", n)
+			path := filepath.Join(tmpDir, key)
+			info, _ := os.Stat(path)
+
+			// Write operations
+			state.UpdateFile(key, info, fmt.Sprintf("hash%d", n))
+			state.MarkUploaded(key)
+
+			// Read operations
+			_ = state.GetFile(key)
+			_ = state.IsEmpty()
+
+			// Delete some files
+			if n%5 == 0 {
+				state.RemoveFile(key)
+			}
+		}(i)
+	}
+	wg.Wait()
 }

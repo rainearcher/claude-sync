@@ -1,12 +1,18 @@
 package sync
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	gosync "sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tawanorg/claude-sync/internal/config"
 	"github.com/tawanorg/claude-sync/internal/crypto"
+	"github.com/tawanorg/claude-sync/internal/storage"
 )
 
 // TestFullWorkflowWithLocalState tests the sync workflow with real crypto
@@ -311,5 +317,365 @@ func TestSyncPathsConfig(t *testing.T) {
 		if !found {
 			t.Errorf("Expected '%s' in SyncPaths", expected)
 		}
+	}
+}
+
+// mockStorage implements storage.Storage for testing
+type mockStorage struct {
+	mu          gosync.Mutex
+	data        map[string][]byte
+	latency     time.Duration
+	failKeys    map[string]error
+	uploadCount atomic.Int32
+	deleteCount atomic.Int32
+}
+
+func newMockStorage(latency time.Duration) *mockStorage {
+	return &mockStorage{
+		data:     make(map[string][]byte),
+		latency:  latency,
+		failKeys: make(map[string]error),
+	}
+}
+
+func (m *mockStorage) Upload(ctx context.Context, key string, data []byte) error {
+	if m.latency > 0 {
+		time.Sleep(m.latency)
+	}
+	m.uploadCount.Add(1)
+	if err, ok := m.failKeys[key]; ok {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data[key] = append([]byte(nil), data...)
+	return nil
+}
+
+func (m *mockStorage) Download(ctx context.Context, key string) ([]byte, error) {
+	if m.latency > 0 {
+		time.Sleep(m.latency)
+	}
+	if err, ok := m.failKeys[key]; ok {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.data[key]
+	if !ok {
+		return nil, fmt.Errorf("key not found: %s", key)
+	}
+	return append([]byte(nil), d...), nil
+}
+
+func (m *mockStorage) Delete(ctx context.Context, key string) error {
+	if m.latency > 0 {
+		time.Sleep(m.latency)
+	}
+	m.deleteCount.Add(1)
+	if err, ok := m.failKeys[key]; ok {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, key)
+	return nil
+}
+
+func (m *mockStorage) DeleteBatch(ctx context.Context, keys []string) error {
+	for _, key := range keys {
+		if err := m.Delete(ctx, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *mockStorage) List(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var objects []storage.ObjectInfo
+	for key, data := range m.data {
+		objects = append(objects, storage.ObjectInfo{
+			Key:          key,
+			Size:         int64(len(data)),
+			LastModified: time.Now(),
+		})
+	}
+	return objects, nil
+}
+
+func (m *mockStorage) Head(ctx context.Context, key string) (*storage.ObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.data[key]
+	if !ok {
+		return nil, fmt.Errorf("key not found: %s", key)
+	}
+	return &storage.ObjectInfo{Key: key, Size: int64(len(d)), LastModified: time.Now()}, nil
+}
+
+func (m *mockStorage) BucketExists(ctx context.Context) (bool, error) {
+	return true, nil
+}
+
+// helper to create a Syncer with mock storage for testing
+func newTestSyncer(t *testing.T, store storage.Storage, claudeDir string) *Syncer {
+	t.Helper()
+
+	// Generate encryption key
+	keyDir := t.TempDir()
+	keyPath := filepath.Join(keyDir, "age-key.txt")
+	if err := crypto.GenerateKeyFromPassphrase(keyPath, "test-passphrase"); err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+	enc, err := crypto.NewEncryptor(keyPath)
+	if err != nil {
+		t.Fatalf("Failed to create encryptor: %v", err)
+	}
+
+	stateDir := t.TempDir()
+	state, err := LoadStateFromDir(stateDir)
+	if err != nil {
+		t.Fatalf("Failed to load state: %v", err)
+	}
+
+	return NewSyncerWithStorage(store, enc, state, claudeDir, true)
+}
+
+func TestPushParallel(t *testing.T) {
+	claudeDir := t.TempDir()
+
+	// Create 20 test files
+	fileCount := 20
+	for i := 0; i < fileCount; i++ {
+		name := fmt.Sprintf("file%d.txt", i)
+		path := filepath.Join(claudeDir, name)
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("content %d", i)), 0644); err != nil {
+			t.Fatalf("Failed to create file: %v", err)
+		}
+	}
+
+	store := newMockStorage(50 * time.Millisecond)
+	syncer := newTestSyncer(t, store, claudeDir)
+
+	// Build sync paths for the test files
+	syncPaths := make([]string, fileCount)
+	for i := 0; i < fileCount; i++ {
+		syncPaths[i] = fmt.Sprintf("file%d.txt", i)
+	}
+
+	start := time.Now()
+	result, err := syncer.PushPaths(context.Background(), syncPaths)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+
+	if len(result.Uploaded) != fileCount {
+		t.Errorf("Expected %d uploaded, got %d", fileCount, len(result.Uploaded))
+	}
+
+	// Sequential at 50ms each would be ~1000ms; parallel should be well under 500ms
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Push took %v, expected < 500ms (parallel should be ~10x faster)", elapsed)
+	}
+
+	t.Logf("Push of %d files took %v", fileCount, elapsed)
+}
+
+func TestPushPartialFailure(t *testing.T) {
+	claudeDir := t.TempDir()
+
+	fileCount := 20
+	syncPaths := make([]string, fileCount)
+	for i := 0; i < fileCount; i++ {
+		name := fmt.Sprintf("file%d.txt", i)
+		syncPaths[i] = name
+		path := filepath.Join(claudeDir, name)
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("content %d", i)), 0644); err != nil {
+			t.Fatalf("Failed to create file: %v", err)
+		}
+	}
+
+	store := newMockStorage(0)
+	// Fail on 3 specific keys (upload adds .age suffix)
+	store.failKeys["file3.txt.age"] = fmt.Errorf("upload failed: simulated")
+	store.failKeys["file7.txt.age"] = fmt.Errorf("upload failed: simulated")
+	store.failKeys["file15.txt.age"] = fmt.Errorf("upload failed: simulated")
+
+	syncer := newTestSyncer(t, store, claudeDir)
+
+	result, err := syncer.PushPaths(context.Background(), syncPaths)
+	if err != nil {
+		t.Fatalf("Push should not return top-level error: %v", err)
+	}
+
+	if len(result.Uploaded) != 17 {
+		t.Errorf("Expected 17 uploaded, got %d", len(result.Uploaded))
+	}
+	if len(result.Errors) != 3 {
+		t.Errorf("Expected 3 errors, got %d", len(result.Errors))
+	}
+
+	// Verify state was only updated for successful files
+	state := syncer.GetState()
+	for i := 0; i < fileCount; i++ {
+		name := fmt.Sprintf("file%d.txt", i)
+		f := state.GetFile(name)
+		if i == 3 || i == 7 || i == 15 {
+			if f != nil {
+				t.Errorf("Failed file %s should NOT be in state", name)
+			}
+		} else {
+			if f == nil {
+				t.Errorf("Successful file %s should be in state", name)
+			}
+		}
+	}
+}
+
+func TestPullParallel(t *testing.T) {
+	claudeDir := t.TempDir()
+
+	// Generate encryption key for the test syncer
+	keyDir := t.TempDir()
+	keyPath := filepath.Join(keyDir, "age-key.txt")
+	if err := crypto.GenerateKeyFromPassphrase(keyPath, "test-passphrase"); err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+	enc, err := crypto.NewEncryptor(keyPath)
+	if err != nil {
+		t.Fatalf("Failed to create encryptor: %v", err)
+	}
+
+	// Pre-populate mock storage with 20 encrypted files
+	store := newMockStorage(50 * time.Millisecond)
+	fileCount := 20
+	originalContent := make(map[string]string)
+	for i := 0; i < fileCount; i++ {
+		name := fmt.Sprintf("file%d.txt", i)
+		content := fmt.Sprintf("content %d", i)
+		originalContent[name] = content
+
+		encrypted, err := enc.Encrypt([]byte(content))
+		if err != nil {
+			t.Fatalf("Failed to encrypt: %v", err)
+		}
+		store.mu.Lock()
+		store.data[name+".age"] = encrypted
+		store.mu.Unlock()
+	}
+
+	stateDir := t.TempDir()
+	state, err := LoadStateFromDir(stateDir)
+	if err != nil {
+		t.Fatalf("Failed to load state: %v", err)
+	}
+
+	syncer := NewSyncerWithStorage(store, enc, state, claudeDir, true)
+
+	start := time.Now()
+	result, err := syncer.Pull(context.Background())
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+
+	if len(result.Downloaded) != fileCount {
+		t.Errorf("Expected %d downloaded, got %d", fileCount, len(result.Downloaded))
+	}
+
+	// Verify files were written to disk with correct content
+	for name, expectedContent := range originalContent {
+		data, err := os.ReadFile(filepath.Join(claudeDir, name))
+		if err != nil {
+			t.Errorf("Failed to read downloaded file %s: %v", name, err)
+			continue
+		}
+		if string(data) != expectedContent {
+			t.Errorf("File %s: expected %q, got %q", name, expectedContent, string(data))
+		}
+	}
+
+	// Sequential at 50ms each would be ~1000ms; parallel should be well under 500ms
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Pull took %v, expected < 500ms (parallel should be ~10x faster)", elapsed)
+	}
+
+	t.Logf("Pull of %d files took %v", fileCount, elapsed)
+}
+
+func TestPushProgressEvents(t *testing.T) {
+	claudeDir := t.TempDir()
+
+	fileCount := 5
+	syncPaths := make([]string, fileCount)
+	for i := 0; i < fileCount; i++ {
+		name := fmt.Sprintf("file%d.txt", i)
+		syncPaths[i] = name
+		path := filepath.Join(claudeDir, name)
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("content %d", i)), 0644); err != nil {
+			t.Fatalf("Failed to create file: %v", err)
+		}
+	}
+
+	store := newMockStorage(0)
+	syncer := newTestSyncer(t, store, claudeDir)
+
+	var mu gosync.Mutex
+	var events []ProgressEvent
+	syncer.SetProgressFunc(func(event ProgressEvent) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	})
+
+	result, err := syncer.PushPaths(context.Background(), syncPaths)
+	if err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+
+	if len(result.Uploaded) != fileCount {
+		t.Errorf("Expected %d uploaded, got %d", fileCount, len(result.Uploaded))
+	}
+
+	// Verify progress events
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Every file should get an upload progress event
+	uploadEvents := 0
+	currentValues := make(map[int]bool)
+	for _, e := range events {
+		if e.Action == "upload" && !e.Complete && e.Error == nil {
+			uploadEvents++
+			currentValues[e.Current] = true
+		}
+	}
+
+	if uploadEvents != fileCount {
+		t.Errorf("Expected %d upload events, got %d", fileCount, uploadEvents)
+	}
+
+	// Current values should cover 1..fileCount (order may vary)
+	for i := 1; i <= fileCount; i++ {
+		if !currentValues[i] {
+			t.Errorf("Missing progress event with Current=%d", i)
+		}
+	}
+
+	// Verify completion event
+	hasComplete := false
+	for _, e := range events {
+		if e.Action == "upload" && e.Complete {
+			hasComplete = true
+			break
+		}
+	}
+	if !hasComplete {
+		t.Error("Missing completion event")
 	}
 }

@@ -6,11 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	gosync "sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tawanorg/claude-sync/internal/config"
 	"github.com/tawanorg/claude-sync/internal/crypto"
 	"github.com/tawanorg/claude-sync/internal/storage"
+	"golang.org/x/sync/errgroup"
 
 	// Register storage adapters
 	_ "github.com/tawanorg/claude-sync/internal/storage/gcs"
@@ -18,13 +21,52 @@ import (
 	_ "github.com/tawanorg/claude-sync/internal/storage/s3"
 )
 
+const defaultConcurrency = 10
+
 type Syncer struct {
-	storage    storage.Storage
-	encryptor  *crypto.Encryptor
-	state      *SyncState
-	claudeDir  string
-	quiet      bool
-	onProgress ProgressFunc
+	storage     storage.Storage
+	encryptor   *crypto.Encryptor
+	state       *SyncState
+	claudeDir   string
+	quiet       bool
+	concurrency int
+	onProgress  ProgressFunc
+}
+
+// syncResultCollector accumulates results from concurrent goroutines
+type syncResultCollector struct {
+	mu     gosync.Mutex
+	result SyncResult
+}
+
+func (c *syncResultCollector) addUploaded(path string) {
+	c.mu.Lock()
+	c.result.Uploaded = append(c.result.Uploaded, path)
+	c.mu.Unlock()
+}
+
+func (c *syncResultCollector) addDeleted(path string) {
+	c.mu.Lock()
+	c.result.Deleted = append(c.result.Deleted, path)
+	c.mu.Unlock()
+}
+
+func (c *syncResultCollector) addError(err error) {
+	c.mu.Lock()
+	c.result.Errors = append(c.result.Errors, err)
+	c.mu.Unlock()
+}
+
+func (c *syncResultCollector) addDownloaded(path string) {
+	c.mu.Lock()
+	c.result.Downloaded = append(c.result.Downloaded, path)
+	c.mu.Unlock()
+}
+
+func (c *syncResultCollector) addConflict(path string) {
+	c.mu.Lock()
+	c.result.Conflicts = append(c.result.Conflicts, path)
+	c.mu.Unlock()
 }
 
 type SyncResult struct {
@@ -77,12 +119,25 @@ func NewSyncer(cfg *config.Config, quiet bool) (*Syncer, error) {
 	}
 
 	return &Syncer{
-		storage:   store,
-		encryptor: enc,
-		state:     state,
-		claudeDir: claudeDir,
-		quiet:     quiet,
+		storage:     store,
+		encryptor:   enc,
+		state:       state,
+		claudeDir:   claudeDir,
+		quiet:       quiet,
+		concurrency: defaultConcurrency,
 	}, nil
+}
+
+// NewSyncerWithStorage creates a Syncer with an injected storage backend (for testing)
+func NewSyncerWithStorage(store storage.Storage, enc *crypto.Encryptor, state *SyncState, claudeDir string, quiet bool) *Syncer {
+	return &Syncer{
+		storage:     store,
+		encryptor:   enc,
+		state:       state,
+		claudeDir:   claudeDir,
+		quiet:       quiet,
+		concurrency: defaultConcurrency,
+	}
 }
 
 func (s *Syncer) SetProgressFunc(fn ProgressFunc) {
@@ -102,60 +157,79 @@ func (s *Syncer) log(format string, args ...interface{}) {
 }
 
 func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
-	result := &SyncResult{}
+	return s.PushPaths(ctx, config.SyncPaths)
+}
 
+// PushPaths pushes changes for the given sync paths concurrently
+func (s *Syncer) PushPaths(ctx context.Context, syncPaths []string) (*SyncResult, error) {
 	s.progress(ProgressEvent{Action: "scan", Path: "Detecting changes..."})
 
-	changes, err := s.state.DetectChanges(s.claudeDir, config.SyncPaths)
+	changes, err := s.state.DetectChanges(s.claudeDir, syncPaths)
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect changes: %w", err)
 	}
 
 	if len(changes) == 0 {
 		s.progress(ProgressEvent{Action: "scan", Complete: true})
-		return result, nil
+		return &SyncResult{}, nil
 	}
 
 	total := len(changes)
-	for i, change := range changes {
-		switch change.Action {
-		case "add", "modify":
-			s.progress(ProgressEvent{
-				Action:  "upload",
-				Path:    change.Path,
-				Size:    change.LocalSize,
-				Current: i + 1,
-				Total:   total,
-			})
+	var completed atomic.Int32
+	collector := &syncResultCollector{}
 
-			if err := s.uploadFile(ctx, change.Path); err != nil {
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.concurrency)
+
+	for _, change := range changes {
+		change := change
+		g.Go(func() error {
+			current := int(completed.Add(1))
+
+			switch change.Action {
+			case "add", "modify":
 				s.progress(ProgressEvent{
-					Action: "upload",
-					Path:   change.Path,
-					Error:  err,
+					Action:  "upload",
+					Path:    change.Path,
+					Size:    change.LocalSize,
+					Current: current,
+					Total:   total,
 				})
-				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", change.Path, err))
-				continue
-			}
-			result.Uploaded = append(result.Uploaded, change.Path)
 
-		case "delete":
-			s.progress(ProgressEvent{
-				Action:  "delete",
-				Path:    change.Path,
-				Current: i + 1,
-				Total:   total,
-			})
+				if err := s.uploadFile(ctx, change.Path); err != nil {
+					s.progress(ProgressEvent{
+						Action: "upload",
+						Path:   change.Path,
+						Error:  err,
+					})
+					collector.addError(fmt.Errorf("%s: %w", change.Path, err))
+					return nil // don't abort other goroutines
+				}
+				collector.addUploaded(change.Path)
 
-			remoteKey := s.remoteKey(change.Path)
-			if err := s.storage.Delete(ctx, remoteKey); err != nil {
-				result.Errors = append(result.Errors, fmt.Errorf("delete %s: %w", change.Path, err))
-				continue
+			case "delete":
+				s.progress(ProgressEvent{
+					Action:  "delete",
+					Path:    change.Path,
+					Current: current,
+					Total:   total,
+				})
+
+				remoteKey := s.remoteKey(change.Path)
+				if err := s.storage.Delete(ctx, remoteKey); err != nil {
+					collector.addError(fmt.Errorf("delete %s: %w", change.Path, err))
+					return nil
+				}
+				s.state.RemoveFile(change.Path)
+				collector.addDeleted(change.Path)
 			}
-			s.state.RemoveFile(change.Path)
-			result.Deleted = append(result.Deleted, change.Path)
-		}
+
+			return nil
+		})
 	}
+
+	_ = g.Wait()
+	result := &collector.result
 
 	s.progress(ProgressEvent{Action: "upload", Complete: true, Total: total})
 
@@ -245,28 +319,42 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 		}
 	}
 
-	// Download files with progress
+	// Download files with progress (parallel)
 	total := len(toDownload)
-	for i, task := range toDownload {
-		s.progress(ProgressEvent{
-			Action:  "download",
-			Path:    task.localPath,
-			Size:    task.remoteObj.Size,
-			Current: i + 1,
-			Total:   total,
-		})
+	var dlCompleted atomic.Int32
+	collector := &syncResultCollector{result: *result}
 
-		if err := s.downloadFile(ctx, task.localPath, task.remoteObj.Key); err != nil {
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.concurrency)
+
+	for _, task := range toDownload {
+		task := task
+		g.Go(func() error {
+			current := int(dlCompleted.Add(1))
 			s.progress(ProgressEvent{
-				Action: "download",
-				Path:   task.localPath,
-				Error:  err,
+				Action:  "download",
+				Path:    task.localPath,
+				Size:    task.remoteObj.Size,
+				Current: current,
+				Total:   total,
 			})
-			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", task.localPath, err))
-			continue
-		}
-		result.Downloaded = append(result.Downloaded, task.localPath)
+
+			if err := s.downloadFile(ctx, task.localPath, task.remoteObj.Key); err != nil {
+				s.progress(ProgressEvent{
+					Action: "download",
+					Path:   task.localPath,
+					Error:  err,
+				})
+				collector.addError(fmt.Errorf("%s: %w", task.localPath, err))
+				return nil
+			}
+			collector.addDownloaded(task.localPath)
+			return nil
+		})
 	}
+
+	_ = g.Wait()
+	result = &collector.result
 
 	s.progress(ProgressEvent{Action: "download", Complete: true, Total: total})
 
@@ -305,8 +393,14 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 	}
 
 	// Update state
-	info, _ := os.Stat(fullPath)
-	hash, _ := HashFile(fullPath)
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat after upload: %w", err)
+	}
+	hash, err := HashFile(fullPath)
+	if err != nil {
+		return fmt.Errorf("failed to hash after upload: %w", err)
+	}
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
 
@@ -339,8 +433,14 @@ func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey strin
 	}
 
 	// Update state
-	info, _ := os.Stat(fullPath)
-	hash, _ := HashFile(fullPath)
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat after download: %w", err)
+	}
+	hash, err := HashFile(fullPath)
+	if err != nil {
+		return fmt.Errorf("failed to hash after download: %w", err)
+	}
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
 

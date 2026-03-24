@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/tawanorg/claude-sync/internal/config"
@@ -22,6 +23,7 @@ type FileState struct {
 }
 
 type SyncState struct {
+	mu       sync.RWMutex          `json:"-"`
 	Files    map[string]*FileState `json:"files"`
 	LastSync time.Time             `json:"last_sync"`
 	DeviceID string                `json:"device_id"`
@@ -101,6 +103,8 @@ func (s *SyncState) Save() error {
 }
 
 func (s *SyncState) UpdateFile(relativePath string, info os.FileInfo, hash string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.Files[relativePath] = &FileState{
 		Path:    relativePath,
 		Hash:    hash,
@@ -110,21 +114,29 @@ func (s *SyncState) UpdateFile(relativePath string, info os.FileInfo, hash strin
 }
 
 func (s *SyncState) MarkUploaded(relativePath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if f, ok := s.Files[relativePath]; ok {
 		f.Uploaded = time.Now()
 	}
 }
 
 func (s *SyncState) GetFile(relativePath string) *FileState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.Files[relativePath]
 }
 
 func (s *SyncState) RemoveFile(relativePath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.Files, relativePath)
 }
 
 // IsEmpty returns true if no files have been synced yet (first sync)
 func (s *SyncState) IsEmpty() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.Files) == 0 && s.LastSync.IsZero()
 }
 
@@ -205,7 +217,22 @@ func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string) ([]FileC
 		return nil, err
 	}
 
-	// Check for new or modified files
+	// Snapshot known files under a short-held lock to avoid blocking
+	// writers during file I/O (hashing)
+	s.mu.RLock()
+	knownFiles := make(map[string]*FileState, len(s.Files))
+	for k, v := range s.Files {
+		knownFiles[k] = &FileState{
+			Path:     v.Path,
+			Hash:     v.Hash,
+			Size:     v.Size,
+			ModTime:  v.ModTime,
+			Uploaded: v.Uploaded,
+		}
+	}
+	s.mu.RUnlock()
+
+	// Check for new or modified files (no lock held — file I/O is safe)
 	for relPath, info := range localFiles {
 		fullPath := filepath.Join(claudeDir, relPath)
 		hash, err := HashFile(fullPath)
@@ -213,7 +240,7 @@ func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string) ([]FileC
 			return nil, fmt.Errorf("failed to hash %s: %w", relPath, err)
 		}
 
-		existing := s.GetFile(relPath)
+		existing := knownFiles[relPath]
 		if existing == nil {
 			changes = append(changes, FileChange{
 				Path:      relPath,
@@ -234,7 +261,7 @@ func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string) ([]FileC
 	}
 
 	// Check for deleted files
-	for relPath := range s.Files {
+	for relPath := range knownFiles {
 		if _, exists := localFiles[relPath]; !exists {
 			changes = append(changes, FileChange{
 				Path:   relPath,
